@@ -140,7 +140,7 @@ func parseConfig() (configFlags, error) {
 	return configFlags{groupField: *group, valueField: *field}, nil
 }
 
-// getOrCreate returns the stats for key, adding an empty entry first if the
+// handleGroupStat returns the stats for key, adding an empty entry first if the
 // group hasn't been seen yet.
 func handleGroupStat(groups map[string]*groupStat, key string) *groupStat {
 	stat, exists := groups[key]
