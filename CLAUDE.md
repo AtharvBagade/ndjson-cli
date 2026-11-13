@@ -26,7 +26,7 @@ This is Project 1 of a personal Go learning roadmap (Linear: ATH-61, project "Go
 - Explain how things work underneath (memory layout, what the runtime does, why the compiler complains), not just what to type.
 - Where it helps, compare with the JavaScript/Node equivalent (e.g. `io.Reader` vs Node streams, errors as values vs exceptions, zero values vs `undefined`).
 - Prefer links to go.dev, pkg.go.dev, and the Go blog over third-party sources.
-- When the user hits a bug, remind them to log it in `BUGS.md`.
+- When the user hits a bug, makes a mistake, or learns something non-obvious (even small), remind them to log it in `LEARNING.md`.
 
 ## Constraints
 
@@ -40,7 +40,7 @@ This is Project 1 of a personal Go learning roadmap (Linear: ATH-61, project "Go
 - Table-driven tests pass.
 - `go vet ./...` is clean.
 - `go test -race ./...` passes.
-- `BUGS.md` lists each bug hit, its symptom, what the compiler or runtime said, and the fix.
+- `LEARNING.md` lists each bug hit and lesson learned: its symptom, what the compiler or runtime said (if anything), the cause, and the fix or takeaway.
 
 ## Commands
 
@@ -66,7 +66,7 @@ When asked to draft or update `README.md`, base it on the code as it currently e
 5. Percentile method: which approach was chosen (exact, reservoir sample, histogram, or streaming estimator), its accuracy trade-off, and why.
 6. Design decisions: malformed-line handling, map vs struct parsing, and any other choice with a real alternative, each with a short reason.
 7. Testing: how to run tests and what the tests cover.
-8. What I learned: Go-specific lessons, with links to entries in `BUGS.md`.
+8. What I learned: Go-specific lessons, with links to entries in `LEARNING.md`.
 9. Limitations and next steps.
 
 Keep the README factual and short. Before writing it, ask the user for anything that cannot be found in the code: for example, the reason behind a design decision.

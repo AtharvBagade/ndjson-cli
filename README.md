@@ -16,17 +16,17 @@ The project is also a deliberate exercise in idiomatic Go: standard library only
 
 | Area | State |
 |---|---|
-| Stream NDJSON from stdin | ✅ Done |
-| `-group`: group by a string or numeric field | ✅ Done |
-| `-field`: count, min, max, mean per group | ✅ Done |
-| Malformed lines skipped and reported with line numbers | ✅ Done |
-| Long lines (up to 1 MB) | ✅ Done |
-| Deterministic, sorted output | ✅ Done |
-| Code split into testable functions taking `io.Reader` / `io.Writer` | ✅ Done |
-| Table-driven tests, `go test -race` | 🔜 Next |
-| File arguments (`ndstats ... a.ndjson b.ndjson`) | 🔜 Planned |
-| `-p 50,95,99` percentiles | 🔜 Planned |
-| Verified constant memory on a multi-GB file | 🔜 Planned |
+| Stream NDJSON from stdin | Done |
+| `-group`: group by a string or numeric field | Done |
+| `-field`: count, min, max, mean per group | Done |
+| Malformed lines skipped and reported with line numbers | Done |
+| Long lines (up to 1 MB) | Done |
+| Deterministic, sorted output | Done |
+| Code split into testable functions taking `io.Reader` / `io.Writer` | Done |
+| Table-driven tests, `go test -race` | Next |
+| File arguments (`ndstats ... a.ndjson b.ndjson`) | Planned |
+| `-p 50,95,99` percentiles | Planned |
+| Verified constant memory on a multi-GB file | Planned |
 
 ## Usage
 
