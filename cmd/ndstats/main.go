@@ -4,19 +4,32 @@ import (
 	"bufio"
 	"cmp"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"math"
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 )
 
+// maxLineSize caps how long a single input line may be. The scanner's buffer
+// never grows past this, which keeps memory bounded on any input.
+const maxLineSize = 1 << 20 // 1 MB
+
 type configFlags struct {
-    groupField string
-    valueField string
+	groupField string
+	valueField string
+}
+
+// totals counts input lines across all groups.
+type totals struct {
+	lines   int // every line read, including blank and malformed ones
+	skipped int // lines that never reached a group
 }
 
 type groupStat struct {
@@ -66,19 +79,21 @@ func normaliseGroupKeys(groups map[string]*groupStat) []string {
 	})
 }
 
-func printFinalStats(groups map[string]*groupStat, groupField string, totalLines, totalLinesSkipped int) {
-	fmt.Printf("%-12s %7s %7s %8s %10s %10s %10s\n", groupField, "count", "values", "skipped", "min", "max", "mean")
+// printFinalStats writes to w rather than stdout so tests can capture the
+// output in a bytes.Buffer.
+func printFinalStats(w io.Writer, groups map[string]*groupStat, groupField string, t totals) {
+	fmt.Fprintf(w, "%-12s %7s %7s %8s %10s %10s %10s\n", groupField, "count", "values", "skipped", "min", "max", "mean")
 	for _, key := range normaliseGroupKeys(groups) {
 		stat := groups[key]
 		if stat.valueCount == 0 {
 			// No usable values: min, max and mean are undefined, not 0.
-			fmt.Printf("%-12s %7d %7d %8d %10s %10s %10s\n", key, stat.count, stat.valueCount, stat.skippedCount, "-", "-", "-")
+			fmt.Fprintf(w, "%-12s %7d %7d %8d %10s %10s %10s\n", key, stat.count, stat.valueCount, stat.skippedCount, "-", "-", "-")
 			continue
 		}
-		fmt.Printf("%-12s %7d %7d %8d %10.2f %10.2f %10.2f\n", key, stat.count, stat.valueCount, stat.skippedCount, stat.min, stat.max, stat.mean())
+		fmt.Fprintf(w, "%-12s %7d %7d %8d %10.2f %10.2f %10.2f\n", key, stat.count, stat.valueCount, stat.skippedCount, stat.min, stat.max, stat.mean())
 	}
-	fmt.Printf("Total lines processed: %d\n", totalLines)
-	fmt.Printf("Lines skipped: %d\n", totalLinesSkipped)
+	fmt.Fprintf(w, "Total lines processed: %d\n", t.lines)
+	fmt.Fprintf(w, "Lines skipped: %d\n", t.skipped)
 }
 
 func toFloat64(value any) (float64, bool) {
@@ -104,87 +119,119 @@ func toString(value any) (string, bool) {
 	return "", false
 }
 
-func parseConfig() *configFlags {
+// parseConfig reads the command-line flags. It returns an error instead of
+// exiting, so main decides what happens on bad usage.
+func parseConfig() (configFlags, error) {
 	group := flag.String("group", "", "field to group records by")
 	field := flag.String("field", "", "field to calculate statistics for")
 	flag.Parse()
 
-    missing := []string{}
-    if *group == "" {
-        missing = append(missing, "-group")
-    }
-    if *field == "" {
-        missing = append(missing, "-field")
-    }
-    if len(missing) > 0 {
-        fmt.Fprintf(os.Stderr, "Missing required flags: %v\n", missing)
-        flag.Usage()
-        os.Exit(2)
-    }
-
-	return &configFlags{
-		groupField: *group,
-		valueField: *field,
+	var missing []string
+	if *group == "" {
+		missing = append(missing, "-group")
 	}
+	if *field == "" {
+		missing = append(missing, "-field")
+	}
+	if len(missing) > 0 {
+		return configFlags{}, fmt.Errorf("missing required flag(s): %s", strings.Join(missing, ", "))
+	}
+
+	return configFlags{groupField: *group, valueField: *field}, nil
 }
 
-func main() {
+// getOrCreate returns the stats for key, adding an empty entry first if the
+// group hasn't been seen yet.
+func handleGroupStat(groups map[string]*groupStat, key string) *groupStat {
+	stat, exists := groups[key]
+	if !exists {
+		stat = &groupStat{}
+		groups[key] = stat
+	}
+	return stat
+}
 
-	config := parseConfig()
+// groupKeyOf returns the record's group key as a string. Numbers are
+// formatted so that 200 and "200" land in the same group.
+func groupKeyOf(record map[string]any, field string) (string, error) {
+	raw, ok := record[field]
+	if !ok {
+		return "", fmt.Errorf("group key %q not found", field)
+	}
+	key, ok := toString(raw)
+	if !ok {
+		return "", fmt.Errorf("group key %q has unsupported type %T", field, raw)
+	}
+	return key, nil
+}
 
-    group := config.groupField
-    field := config.valueField
+// processLine adds one NDJSON line to groups. It returns an error when the
+// line can't be assigned to a group; a missing or unusable -field value is
+// not an error, it is counted on the group instead.
+func processLine(groups map[string]*groupStat, line string, cfg configFlags) error {
+	var record map[string]any
+	if err := json.Unmarshal([]byte(line), &record); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
 
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	key, err := groupKeyOf(record, cfg.groupField)
+	if err != nil {
+		return err
+	}
+
+	stat := handleGroupStat(groups, key)
+	stat.incrementCount()
+
+	// A missing key gives nil, which toFloat64 rejects like any other
+	// unusable value. The record still counts toward its group.
+	value, ok := toFloat64(record[cfg.valueField])
+	if !ok {
+		stat.incrementSkippedCount()
+		return nil
+	}
+	stat.addValue(value)
+	return nil
+}
+
+// aggregate reads NDJSON from r line by line and builds per-group stats.
+// Taking an io.Reader means stdin, a file, or a strings.Reader in a test all
+// go through the same code.
+func aggregate(r io.Reader, cfg configFlags) (map[string]*groupStat, totals, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
 
 	groups := make(map[string]*groupStat)
-
-	totalLines := 0
-	totalLinesSkipped := 0
+	var t totals
 
 	for scanner.Scan() {
-		totalLines++
-		text := scanner.Text()
-		var jsonValue map[string]any
-		err := json.Unmarshal([]byte(text), &jsonValue)
-		if err != nil {
-			log.Printf("Error parsing JSON: %v at line %d", err, totalLines)
-			totalLinesSkipped++
-			continue
+		t.lines++
+		if err := processLine(groups, scanner.Text(), cfg); err != nil {
+			log.Printf("line %d: %v", t.lines, err)
+			t.skipped++
 		}
-		raw, ok := jsonValue[group]
-		if !ok {
-			log.Printf("Group key '%s' not found : %v at line %d", group, jsonValue, totalLines)
-			totalLinesSkipped++
-			continue
-		}
-
-		groupKey, ok := toString(raw)
-		if !ok {
-			log.Printf("Not a string or number for group key '%s' : %v at line %d", group, raw, totalLines)
-			totalLinesSkipped++
-			continue
-		}
-
-		stat, exists := groups[groupKey]
-		if !exists {
-			stat = &groupStat{}
-			groups[groupKey] = stat
-		}
-		stat.incrementCount()
-
-		value, ok := toFloat64(jsonValue[field])
-		if !ok {
-			stat.incrementSkippedCount()
-			continue
-		}
-		stat.addValue(value)
 	}
 
 	if err := scanner.Err(); err != nil {
+		return nil, t, fmt.Errorf("reading input after line %d: %w", t.lines, err)
+	}
+	return groups, t, nil
+}
+
+func main() {
+	cfg, err := parseConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	groups, t, err := aggregate(os.Stdin, cfg)
+	if err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			log.Fatalf("%v (lines are limited to %d bytes)", err, maxLineSize)
+		}
 		log.Fatal(err)
 	}
 
-	printFinalStats(groups, group, totalLines, totalLinesSkipped)
+	printFinalStats(os.Stdout, groups, cfg.groupField, t)
 }
