@@ -19,11 +19,14 @@ The project is also a deliberate exercise in idiomatic Go: standard library only
 | Stream NDJSON from stdin | Done |
 | `-group`: group by a string or numeric field | Done |
 | `-field`: count, min, max, mean per group | Done |
-| Malformed lines skipped and reported with line numbers | Done |
+| Bad lines skipped and reported with line numbers | Done |
+| `-strict`: stop at the first bad line instead | Done |
+| Whitespace trimmed from values and group keys; blank lines ignored | Done |
 | Long lines (up to 1 MB) | Done |
 | Deterministic, sorted output | Done |
 | Code split into testable functions taking `io.Reader` / `io.Writer` | Done |
-| Table-driven tests, `go test -race` | Next |
+| Table-driven tests, `go test -race` (107 cases, ~90% coverage) | Done |
+| One summary of skipped lines instead of a log line each | Next |
 | File arguments (`ndstats ... a.ndjson b.ndjson`) | Planned |
 | `-p 50,95,99` percentiles | Planned |
 | Verified constant memory on a multi-GB file | Planned |
@@ -42,6 +45,7 @@ go install github.com/AtharvBagade/ndjson-cli/cmd/ndstats@latest
 |---|---|---|
 | `-group` | (required) | Field to group records by |
 | `-field` | (required) | Numeric field to compute statistics for |
+| `-strict` | `false` | Stop at the first line that can't be assigned to a group, instead of skipping it |
 
 Input is read from stdin. If a required flag is missing, `ndstats` names it, prints usage, and exits with status 2:
 
@@ -56,15 +60,16 @@ Latency per region:
 
 ```
 $ ndstats -group region -field latency_ms < testdata/small.ndjson
-2026/11/13 21:23:04 line 9: invalid JSON: unexpected end of JSON input
-2026/11/13 21:23:04 line 11: invalid JSON: unexpected end of JSON input
+2026/11/14 15:05:02 line 9: invalid JSON: unexpected end of JSON input
 region         count  values  skipped        min        max       mean
 us-east            7       5        2       3.20     980.00     251.06
 eu-west            6       4        2      18.90      45.00      29.00
-ap-south           4       1        3    1200.50    1200.50    1200.50
+ap-south           4       2        2       7.50    1200.50     604.00
 Total lines processed: 19
-Lines skipped: 2
+Lines skipped: 1
 ```
+
+Line 9 is truncated JSON, so it's skipped and counted. Line 11 is blank, so it's ignored and not counted as skipped.
 
 Bytes per status code, with diagnostics hidden:
 
@@ -76,7 +81,16 @@ status         count  values  skipped        min        max       mean
 500                2       2        0      64.00      90.00      77.00
 503                1       1        0       0.00       0.00       0.00
 Total lines processed: 19
-Lines skipped: 2
+Lines skipped: 1
+```
+
+Strict mode, which stops at the first bad line and prints no table:
+
+```
+$ ndstats -group region -field latency_ms -strict < testdata/small.ndjson
+2026/11/14 15:05:02 line 9: invalid JSON: unexpected end of JSON input
+$ echo $?
+1
 ```
 
 Columns:
@@ -90,10 +104,12 @@ The table goes to stdout and diagnostics go to stderr, so the output can be pipe
 
 ## Input format
 
-- Each line must be a JSON **object**. A line that isn't valid JSON, or isn't an object, is skipped and reported with its line number. Lines can be up to 1 MB long.
+- Each line must be a JSON **object**. Lines can be up to 1 MB long.
+- **Blank lines** (empty or whitespace only) are ignored. They still count toward line numbers, so diagnostics match the file.
+- **Bad lines**: a line that isn't valid JSON, isn't an object, or has no usable group key is skipped, counted in "Lines skipped" and reported on stderr with its line number. With `-strict`, the first such line stops the run with exit status 1.
 - Fields are addressed by top-level name. Nested fields (e.g. `meta.host`) are not supported yet.
-- **Group key** (`-group`): strings are used as-is. Numbers are formatted without trailing zeros, so `200` and `"200"` fall into the same group. A record whose group field is missing, `null`, a boolean, an object or an array is skipped and reported.
-- **Value** (`-field`): JSON numbers and numeric strings (`"45"`) are accepted. Missing, `null`, non-numeric strings (`"fast"`), `"NaN"`, `"Inf"` and other types are not used as values. The record still counts toward its group, and the value is counted in that group's **skipped** column.
+- **Group key** (`-group`): strings are used with surrounding whitespace trimmed, so `" us-east "` and `"us-east"` are one group. Numbers are formatted without trailing zeros, so `200` and `"200"` fall into the same group. A group field that is missing, `null`, empty or whitespace only, a boolean, an object or an array makes the line a bad line.
+- **Value** (`-field`): JSON numbers and numeric strings are accepted, with surrounding whitespace trimmed (`"45"`, `" 7.5"`). Missing, `null`, non-numeric strings (`"fast"`), `"NaN"`, `"Inf"` and other types are not used as values. This isn't a bad line, even with `-strict`: the record still counts toward its group, and the value is counted in that group's **skipped** column.
 
 ## How it works
 
@@ -102,8 +118,8 @@ io.Reader → bufio.Scanner → json.Unmarshal → per-group stats → sorted ta
  (stdin)     (1 MB cap)       (one line)      (running totals)   (io.Writer)
 ```
 
-- **`aggregate(r io.Reader, cfg)`** owns the scanner, the line limit, line counting and read errors. Because it takes an `io.Reader`, stdin, files and `strings.NewReader` in tests all go through the same code.
-- **`processLine`** parses one line, resolves its group key and updates that group. It returns an error only when the line can't be assigned to a group.
+- **`aggregate(r io.Reader, cfg)`** owns the scanner, the line limit, line counting and read errors. Because it takes an `io.Reader`, stdin, files and `strings.NewReader` in tests all go through the same code. It also decides what happens to a bad line: skip and count it, or, with `-strict`, return it as an error.
+- **`processLine`** parses one line, resolves its group key and updates that group. It returns an error only when the line can't be assigned to a group, and it doesn't know about strict mode. Blank lines return the sentinel `errBlankLine` and invalid JSON wraps `errBadJSON`, so `aggregate` can tell them apart with `errors.Is`.
 - **`groupStat`** keeps `count`, `valueCount`, `skippedCount`, `sum`, `min` and `max`. Each line updates these in place and is then discarded.
 - **`printFinalStats(w io.Writer, …)`** sorts the groups and writes the table.
 
@@ -113,7 +129,10 @@ io.Reader → bufio.Scanner → json.Unmarshal → per-group stats → sorted ta
 
 | Decision | Choice | Why |
 |---|---|---|
-| Malformed lines | Skip, count, log with line number | One bad line in a multi-GB log shouldn't abort the whole run. The final count makes skipped lines visible. |
+| Bad lines | Skip, count, log with line number by default; `-strict` stops at the first one | One bad line in a multi-GB log shouldn't lose the whole run, but some pipelines need to fail loudly on bad input. The final count makes skipped lines visible either way. |
+| Blank lines | Ignored, not counted as skipped | A blank line isn't lost data, so it shouldn't raise the skipped count. Line numbers still include them. |
+| Whitespace | Trimmed from values and group keys | `" 7.5"` and `"us-east "` are almost always formatting noise, not different data. A key that is only whitespace is rejected rather than becoming a group named `""`. |
+| Error kinds | Sentinel errors (`errBlankLine`, `errBadJSON`) wrapped with `%w` | `aggregate` and `main` can recognise the kind with `errors.Is` while the message keeps the parser's details. |
 | Parsing | `map[string]any` instead of a struct | The field names come from flags at runtime, so they can't be known ahead of time to define struct fields. |
 | Numeric vs string group keys | Merge `200` and `"200"` | The same field is often a number in some records and a string in others. Users mean the same group. |
 | Numeric strings as values | Accepted | Same reason. `"45"` is a latency of 45. |
@@ -129,12 +148,20 @@ io.Reader → bufio.Scanner → json.Unmarshal → per-group stats → sorted ta
 ## Testing
 
 ```sh
-go vet ./...      # clean
-go test ./...
+go vet ./...                 # clean
+go test ./...                # 107 table-driven cases
 go test -race ./...
+go test -cover ./cmd/ndstats # ~90% of statements
 ```
 
-Tests haven't been written yet. The code is split so that each piece can be tested on its own: `toFloat64`, `groupKeyOf` and `processLine` take values and return values, `aggregate` takes any `io.Reader`, and `printFinalStats` writes to any `io.Writer`. `testdata/small.ndjson` covers each edge case above: malformed and blank lines, numbers vs strings, missing, `null`, `"fast"`, `"NaN"`, `"Inf"`, booleans and nested objects. `testdata/longline.ndjson` has a line over 64 KB.
+The tests are table-driven and split by topic:
+
+- **`helpers_test.go`** covers the value-in, value-out functions: `toFloat64` (numbers, numeric and padded strings, `"NaN"`, `"Inf"`, `"1e400"`, wrong types), `toString`, `groupKeyOf`, the `groupStat` methods (including all-negative data and zero as a real value), `handleGroupStat`, the sort order (repeated runs catch random map order), and `parseConfig` (with a fresh `flag.FlagSet` per case).
+- **`aggregate_test.go`** covers `processLine` (each kind of good and bad line, checked with `errors.Is` against the sentinels), error wrapping (`errors.As` finds the original `*json.SyntaxError`), `aggregate` in default and strict mode, an end-to-end run on `testdata/small.ndjson` against a hand-computed table, the 69 KB line in `testdata/longline.ndjson`, a line over the 1 MB limit (`errors.Is(err, bufio.ErrTooLong)`), and the exact table output written to a `bytes.Buffer`.
+
+`testdata/small.ndjson` has one edge case per line: malformed and blank lines, numbers vs strings, missing, `null`, `"fast"`, `"NaN"`, `"Inf"`, booleans, nested objects and padded numeric strings. `testdata/longline.ndjson` contains a realistic checkout log line with a full order response body, longer than `bufio.Scanner`'s 64 KB default.
+
+`main` itself isn't tested. It only connects `parseConfig`, `aggregate` and `printFinalStats`, which are.
 
 ## What I learned
 
@@ -148,18 +175,18 @@ Go-specific lessons from building this, each found by hitting it in practice:
 - **Map iteration order is random by design.** Sort the keys before output, and use a comparison function that never returns 0 for two different keys.
 - **`strconv.ParseFloat("NaN")` succeeds.** NaN and Inf are valid IEEE 754 values, so the program has to reject them itself.
 - **Zero values aren't always valid starting values.** `min` starting at `0` is wrong.
-- **Errors are values.** Return them, wrap them with `%w`, and let `main` decide what to do. `errors.Is` finds a sentinel error through the wrapping.
+- **Errors are values.** The function that finds a problem returns it, and the caller decides what to do. That's how `-strict` was added without changing `processLine`. `errors.Is` finds a sentinel error through the wrapping.
+- **Branching on error kinds needs a `default`.** Without one, an error kind nobody checked for is silently dropped. A test caught exactly that.
+- **`errors.Unwrap` returns `nil` for an error that wraps two errors** (`fmt.Errorf("%w: %w", a, b)`). `errors.Is` and `errors.As` search the whole chain.
+- **Strings are immutable.** `strings.TrimSpace` returns a new string, and the original is unchanged.
 - **Accept interfaces (`io.Reader`, `io.Writer`) at the boundaries** so the same code works with stdin, files and tests.
+- **Tests belong to the package, not to a file.** Any number of `_test.go` files can test unexported functions, and changing a test row first, then the code, makes each behaviour change visible.
 
 ## Limitations and next steps
 
-- **Tests:** table-driven tests for each function and an end-to-end test on `testdata/small.ndjson`; `go test -race`.
+- **Skip summary:** replace the log line for each bad line with one summary per reason (e.g. `1 invalid JSON (first at line 9)`). On a large, messy file the current per-line log can be very long.
 - **File arguments:** read one or more files, falling back to stdin, with `file:line` in diagnostics.
 - **Percentiles (`-p`):** choose a constant-memory method (histogram, reservoir sample or streaming estimator), since keeping every value would break the memory guarantee.
-- **Decided, not yet implemented:**
-  - trim whitespace around numeric strings (`" 7.5"` is currently skipped);
-  - skip blank lines quietly (they're currently reported as invalid JSON);
-  - replace the per-line log with one summary per skip reason.
 - **Constant memory** still has to be measured on a multi-GB file.
 - **Nested field paths** (`meta.host`) are not supported.
 - Standard library only.
