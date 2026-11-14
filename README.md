@@ -30,7 +30,7 @@ The project is also a deliberate exercise in idiomatic Go: standard library only
 | File arguments, merged into one table; `-` for stdin; `file:line` in messages | Done |
 | Table-driven tests, `go test -race` (134 cases, ~93% coverage) | Done |
 | `-p 50,95,99` percentiles | Next |
-| Verified constant memory on a multi-GB file | Planned |
+| Verified constant memory (measured up to 1 GB) | Done |
 | `-v`: log every skipped line as well as the summary | Planned |
 
 ## Usage
@@ -184,6 +184,22 @@ files / stdin → bufio.Scanner → json.Unmarshal → per-group stats → sorte
 
 **Why memory stays constant:** no record or value is kept after its line is processed. The scanner's buffer is capped at 1 MB (`maxLineSize = 1 << 20`), and each group holds six numbers. Memory grows with the number of distinct groups, not with the input size.
 
+Measured with `/usr/bin/time -l` (macOS, Apple Silicon) on files from the generator, grouping into 6 regions:
+
+| Input | Lines | Peak memory (max RSS) | Time |
+|---|---|---|---|
+| 50 MB | 297,674 | 11.2 MB | 0.40 s |
+| 500 MB | 2,976,419 | 11.5 MB | 3.80 s |
+| 1 GB | 6,095,675 | 11.9 MB | 7.94 s |
+
+20× the input adds under 1 MB of memory, and time grows linearly (about 130 MB/s, CPU-bound on JSON parsing). To reproduce:
+
+```sh
+go build -o /tmp/ndstats ./cmd/ndstats
+go run ./testdata/gen -size 1G > /tmp/1g.ndjson
+/usr/bin/time -l /tmp/ndstats -group region -field latency_ms /tmp/1g.ndjson > /dev/null
+```
+
 ## Design decisions
 
 | Decision | Choice | Why |
@@ -224,6 +240,18 @@ The tests are table-driven and split by topic:
 
 `testdata/small.ndjson` has one edge case per line: malformed and blank lines, numbers vs strings, missing, `null`, `"fast"`, `"NaN"`, `"Inf"`, booleans, nested objects and padded numeric strings. `testdata/longline.ndjson` contains a realistic checkout log line with a full order response body, longer than `bufio.Scanner`'s 64 KB default.
 
+**`testdata/gen`** generates large synthetic access logs for measuring memory and speed. It streams its output, so it runs in constant memory too, and the same `-seed` always gives the same file. The Go tool skips directories named `testdata`, so it isn't part of `go build`/`go test ./...`; run it with `go run ./testdata/gen`:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-lines` | 0 | Number of lines to write |
+| `-size` | | Stop after about this many bytes (`500M`, `2G`), instead of `-lines` |
+| `-groups` | 0 | Use `region-0` … `region-N` instead of six real regions, to test many groups |
+| `-bad` | 0.001 | Fraction of bad lines (truncated JSON, missing `region`, `"fast"` latency, blank) |
+| `-seed` | 1 | Random seed |
+
+Latencies are log-normal (mostly fast, with a long slow tail), like real traffic.
+
 - **`run_test.go`** calls `run` with real files in `t.TempDir()`, a `strings.Reader` as stdin and `bytes.Buffer`s as stdout and stderr: no files (stdin), two files merged, a file without a trailing newline, per-file line numbers in the summary, a missing file with and without `-strict`, a bad line under `-strict`, `-` between files, and a directory. It also checks that a missing file's error matches `fs.ErrNotExist`, that two inputs add to one aggregator, and the `printError` hints.
 
 `main` itself isn't tested. It only parses flags, calls `run` and picks the exit code.
@@ -254,7 +282,7 @@ Go-specific lessons from building this, each found by hitting it in practice:
 ## Limitations and next steps
 
 - **Percentiles (`-p`):** choose a constant-memory method (histogram, reservoir sample or streaming estimator), since keeping every value would break the memory guarantee.
-- **Constant memory** still has to be measured on a multi-GB file.
+- **Memory with many groups:** measure how memory grows with the number of distinct groups (`testdata/gen -groups`), the one input that should make it grow.
 - **`-v` (verbose):** optionally log every skipped line as well as the summary, e.g. to `grep` through them.
 - **Nested field paths** (`meta.host`) are not supported.
 - Standard library only.
