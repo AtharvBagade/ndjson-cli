@@ -1,0 +1,6 @@
+# Large files from the test-data generator (go run ./testdata/gen ... > file)
+testdata/gen/*.ndjson
+
+# Binaries built in the repo root
+/ndstats
+/gen
