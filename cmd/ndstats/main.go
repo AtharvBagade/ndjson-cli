@@ -21,9 +21,13 @@ import (
 // never grows past this, which keeps memory bounded on any input.
 const maxLineSize = 1 << 20 // 1 MB
 
+var errBlankLine = errors.New("blank line")
+var errBadJSON = errors.New("invalid JSON")
+
 type configFlags struct {
 	groupField string
 	valueField string
+	strict     bool
 }
 
 // totals counts input lines across all groups.
@@ -101,7 +105,11 @@ func toFloat64(value any) (float64, bool) {
 	case float64:
 		return v, true
 	case string:
-		f, err := strconv.ParseFloat(v, 64)
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(trimmed, 64)
 		if err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 			return f, true
 		}
@@ -112,7 +120,7 @@ func toFloat64(value any) (float64, bool) {
 func toString(value any) (string, bool) {
 	switch v := value.(type) {
 	case string:
-		return v, true
+		return strings.TrimSpace(v), true
 	case float64:
 		return strconv.FormatFloat(v, 'f', -1, 64), true
 	}
@@ -124,6 +132,7 @@ func toString(value any) (string, bool) {
 func parseConfig() (configFlags, error) {
 	group := flag.String("group", "", "field to group records by")
 	field := flag.String("field", "", "field to calculate statistics for")
+	strict := flag.Bool("strict", false, "stop at the first line that can't be assigned to a group, instead of skipping it")
 	flag.Parse()
 
 	var missing []string
@@ -137,7 +146,7 @@ func parseConfig() (configFlags, error) {
 		return configFlags{}, fmt.Errorf("missing required flag(s): %s", strings.Join(missing, ", "))
 	}
 
-	return configFlags{groupField: *group, valueField: *field}, nil
+	return configFlags{groupField: *group, valueField: *field, strict: *strict}, nil
 }
 
 // handleGroupStat returns the stats for key, adding an empty entry first if the
@@ -162,6 +171,9 @@ func groupKeyOf(record map[string]any, field string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("group key %q has unsupported type %T", field, raw)
 	}
+	if key == "" {
+		return "", fmt.Errorf("group key %q is empty", field)
+	}
 	return key, nil
 }
 
@@ -169,9 +181,14 @@ func groupKeyOf(record map[string]any, field string) (string, error) {
 // line can't be assigned to a group; a missing or unusable -field value is
 // not an error, it is counted on the group instead.
 func processLine(groups map[string]*groupStat, line string, cfg configFlags) error {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return errBlankLine
+	}
+
 	var record map[string]any
 	if err := json.Unmarshal([]byte(line), &record); err != nil {
-		return fmt.Errorf("invalid JSON: %w", err)
+		return fmt.Errorf("%w: %w", errBadJSON, err)
 	}
 
 	key, err := groupKeyOf(record, cfg.groupField)
@@ -205,7 +222,16 @@ func aggregate(r io.Reader, cfg configFlags) (map[string]*groupStat, totals, err
 
 	for scanner.Scan() {
 		t.lines++
-		if err := processLine(groups, scanner.Text(), cfg); err != nil {
+		err := processLine(groups, scanner.Text(), cfg)
+		switch {
+		case err == nil, errors.Is(err, errBlankLine):
+			// A good line, or a blank one: nothing to report in either mode.
+		case cfg.strict:
+			// Stop at the first bad line. %w keeps err in the chain, so the
+			// caller can still ask errors.Is(err, errBadJSON).
+			return nil, t, fmt.Errorf("line %d: %w", t.lines, err)
+		default:
+			// Skip the line, keep going, and count it.
 			log.Printf("line %d: %v", t.lines, err)
 			t.skipped++
 		}
