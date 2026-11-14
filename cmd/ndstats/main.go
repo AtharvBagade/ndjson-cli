@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"maps"
 	"math"
 	"os"
@@ -46,6 +45,7 @@ type configFlags struct {
 // a count, plus the line number and error of the first occurrence.
 type skipReason struct {
 	count     int
+	firstFile string // "" when reading stdin with no file arguments
 	firstLine int
 	firstErr  error
 }
@@ -57,26 +57,16 @@ type totals struct {
 	reasons map[error]*skipReason // keyed by sentinel (one of skipKinds)
 }
 
-// kindOf returns which sentinel in skipKinds err wraps, or errOtherSkip.
-func kindOf(err error) error {
-	for _, kind := range skipKinds {
-		if errors.Is(err, kind) {
-			return kind
-		}
-	}
-	return errOtherSkip
-}
-
 // recordSkip counts a skipped line under its kind. Only the first line and
 // error of each kind are kept, so memory doesn't grow with bad lines.
-func (t *totals) recordSkip(line int, err error) {
+func (t *totals) recordSkip(file string, line int, err error) {
 	if t.reasons == nil {
 		t.reasons = make(map[error]*skipReason)
 	}
 	kind := kindOf(err)
 	r, ok := t.reasons[kind]
 	if !ok {
-		r = &skipReason{firstLine: line, firstErr: err}
+		r = &skipReason{firstFile: file, firstLine: line, firstErr: err}
 		t.reasons[kind] = r
 	}
 	r.count++
@@ -117,6 +107,222 @@ func (g *groupStat) addValue(v float64) {
 
 func (g *groupStat) mean() float64 {
 	return g.sum / float64(g.valueCount)
+}
+
+// aggregator accumulates stats across any number of inputs, so several files
+// merge into one table. Each call to add reads one input.
+type aggregator struct {
+	cfg    configFlags
+	groups map[string]*groupStat
+	t      totals
+}
+
+func newAggregator(cfg configFlags) *aggregator {
+	return &aggregator{cfg: cfg, groups: make(map[string]*groupStat)}
+}
+
+// add reads NDJSON from r line by line and adds it to the running stats.
+// name labels the input in messages ("" for unnamed stdin). Line numbers
+// restart at 1 for each input; a.t.lines keeps the overall total.
+func (a *aggregator) add(r io.Reader, name string) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
+
+	line := 0
+	for scanner.Scan() {
+		line++
+		a.t.lines++
+		err := processLine(a.groups, scanner.Text(), a.cfg)
+		switch {
+		case err == nil, errors.Is(err, errBlankLine):
+			// A good line, or a blank one: nothing to report in either mode.
+		case a.cfg.strict:
+			// Stop at the first bad line. %w keeps err in the chain, so the
+			// caller can still ask errors.Is(err, errBadJSON).
+			return fmt.Errorf("%s: %w", location(name, line), err)
+		default:
+			// Skip the line, keep going, and count it by kind. The summary
+			// is printed once at the end instead of a log line per skip.
+			a.t.recordSkip(name, line, err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		if line == 0 {
+			return err // nothing read yet; the OS error already names the file
+		}
+		input := name
+		if input == "" {
+			input = "input"
+		}
+		return fmt.Errorf("reading %s after line %d: %w", input, line, err)
+	}
+	return nil
+}
+
+// addFile opens path and adds it. "-" means stdin, as in cat and grep, and
+// "" means stdin without a name (no file arguments were given), so its
+// messages say "line N" instead of "<stdin>:N".
+// Each file is opened and closed inside its own call, so the deferred Close
+// runs as soon as this file is done, not when the whole program finishes.
+func (a *aggregator) addFile(path string, stdin io.Reader) error {
+	switch path {
+	case "":
+		return a.add(stdin, "")
+	case "-":
+		return a.add(stdin, "<stdin>")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err // already says which file: "open x.ndjson: no such file or directory"
+	}
+	defer f.Close()
+	return a.add(f, path)
+}
+
+// parseConfig reads the command-line flags. It returns an error instead of
+// exiting, so main decides what happens on bad usage.
+func parseConfig() (configFlags, error) {
+	group := flag.String("group", "", "field to group records by")
+	field := flag.String("field", "", "field to calculate statistics for")
+	strict := flag.Bool("strict", false, "stop at the first line that can't be assigned to a group, or the first file that can't be read")
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintln(out, "usage: ndstats -group <field> -field <field> [-strict] [file ...]")
+		fmt.Fprintln(out, "Reads NDJSON from the files, or from stdin if none are given (\"-\" also means stdin).")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	var missing []string
+	if *group == "" {
+		missing = append(missing, "-group")
+	}
+	if *field == "" {
+		missing = append(missing, "-field")
+	}
+	if len(missing) > 0 {
+		return configFlags{}, fmt.Errorf("missing required flag(s): %s", strings.Join(missing, ", "))
+	}
+
+	return configFlags{groupField: *group, valueField: *field, strict: *strict}, nil
+}
+
+func toFloat64(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(trimmed, 64)
+		if err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+func toString(value any) (string, bool) {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v), true
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), true
+	}
+	return "", false
+}
+
+// groupKeyOf returns the record's group key as a string. Numbers are
+// formatted so that 200 and "200" land in the same group.
+func groupKeyOf(record map[string]any, field string) (string, error) {
+	raw, ok := record[field]
+	if !ok {
+		return "", fmt.Errorf("%w: %q", errNoGroupKey, field)
+	}
+	key, ok := toString(raw)
+	if !ok {
+		return "", fmt.Errorf("%w: %q has type %T", errBadGroupKey, field, raw)
+	}
+	if key == "" {
+		return "", fmt.Errorf("%w: %q is empty", errBadGroupKey, field)
+	}
+	return key, nil
+}
+
+// handleGroupStat returns the stats for key, adding an empty entry first if the
+// group hasn't been seen yet.
+func handleGroupStat(groups map[string]*groupStat, key string) *groupStat {
+	stat, exists := groups[key]
+	if !exists {
+		stat = &groupStat{}
+		groups[key] = stat
+	}
+	return stat
+}
+
+// processLine adds one NDJSON line to groups. It returns an error when the
+// line can't be assigned to a group; a missing or unusable -field value is
+// not an error, it is counted on the group instead.
+func processLine(groups map[string]*groupStat, line string, cfg configFlags) error {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return errBlankLine
+	}
+
+	var record map[string]any
+	if err := json.Unmarshal([]byte(line), &record); err != nil {
+		return fmt.Errorf("%w: %w", errBadJSON, err)
+	}
+
+	key, err := groupKeyOf(record, cfg.groupField)
+	if err != nil {
+		return err
+	}
+
+	stat := handleGroupStat(groups, key)
+	stat.incrementCount()
+
+	// A missing key gives nil, which toFloat64 rejects like any other
+	// unusable value. The record still counts toward its group.
+	value, ok := toFloat64(record[cfg.valueField])
+	if !ok {
+		stat.incrementSkippedCount()
+		return nil
+	}
+	stat.addValue(value)
+	return nil
+}
+
+// aggregate reads a single unnamed input. It is a convenience wrapper over
+// aggregator for one reader.
+func aggregate(r io.Reader, cfg configFlags) (map[string]*groupStat, totals, error) {
+	a := newAggregator(cfg)
+	if err := a.add(r, ""); err != nil {
+		return nil, a.t, err
+	}
+	return a.groups, a.t, nil
+}
+
+// kindOf returns which sentinel in skipKinds err wraps, or errOtherSkip.
+func kindOf(err error) error {
+	for _, kind := range skipKinds {
+		if errors.Is(err, kind) {
+			return kind
+		}
+	}
+	return errOtherSkip
+}
+
+// location formats where a line is, the way compilers and grep -n do:
+// "a.ndjson:9" for a named input, or "line 9" for unnamed stdin.
+func location(file string, line int) string {
+	if file == "" {
+		return fmt.Sprintf("line %d", line)
+	}
+	return fmt.Sprintf("%s:%d", file, line)
 }
 
 func normaliseGroupKeys(groups map[string]*groupStat) []string {
@@ -163,151 +369,49 @@ func printSkipSummary(w io.Writer, t totals) {
 		// firstErr starts with that same text (it was wrapped as
 		// "%w: details"), so trim it to avoid printing the label twice.
 		detail := strings.TrimPrefix(r.firstErr.Error(), kind.Error()+": ")
-		fmt.Fprintf(w, "  %s: %d (first at line %d: %s)\n", kind.Error(), r.count, r.firstLine, detail)
+		fmt.Fprintf(w, "  %s: %d (first at %s: %s)\n", kind.Error(), r.count, location(r.firstFile, r.firstLine), detail)
 	}
 }
 
-func toFloat64(value any) (float64, bool) {
-	switch v := value.(type) {
-	case float64:
-		return v, true
-	case string:
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
-			return 0, false
+// printError writes err to w as "ndstats: <message>", adding a hint to
+// errors a user can act on.
+func printError(w io.Writer, err error) {
+	msg := err.Error()
+	if errors.Is(err, bufio.ErrTooLong) {
+		msg += fmt.Sprintf(" (lines are limited to %d bytes)", maxLineSize)
+	}
+	fmt.Fprintf(w, "ndstats: %s\n", msg)
+}
+
+// run reads every input, prints the table and the skip summary, and reports
+// whether all inputs were read cleanly. It takes its inputs and outputs as
+// parameters so tests can call it directly; what to do about failure (such
+// as the process exit code) is left to the caller.
+func run(paths []string, cfg configFlags, stdin io.Reader, stdout, stderr io.Writer) (ok bool) {
+	if len(paths) == 0 {
+		paths = []string{""} // no file arguments: read stdin
+	}
+
+	a := newAggregator(cfg)
+	ok = true
+	for _, path := range paths {
+		err := a.addFile(path, stdin)
+		if err == nil {
+			continue
 		}
-		f, err := strconv.ParseFloat(trimmed, 64)
-		if err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
-			return f, true
-		}
-	}
-	return 0, false
-}
-
-func toString(value any) (string, bool) {
-	switch v := value.(type) {
-	case string:
-		return strings.TrimSpace(v), true
-	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64), true
-	}
-	return "", false
-}
-
-// parseConfig reads the command-line flags. It returns an error instead of
-// exiting, so main decides what happens on bad usage.
-func parseConfig() (configFlags, error) {
-	group := flag.String("group", "", "field to group records by")
-	field := flag.String("field", "", "field to calculate statistics for")
-	strict := flag.Bool("strict", false, "stop at the first line that can't be assigned to a group, instead of skipping it")
-	flag.Parse()
-
-	var missing []string
-	if *group == "" {
-		missing = append(missing, "-group")
-	}
-	if *field == "" {
-		missing = append(missing, "-field")
-	}
-	if len(missing) > 0 {
-		return configFlags{}, fmt.Errorf("missing required flag(s): %s", strings.Join(missing, ", "))
-	}
-
-	return configFlags{groupField: *group, valueField: *field, strict: *strict}, nil
-}
-
-// handleGroupStat returns the stats for key, adding an empty entry first if the
-// group hasn't been seen yet.
-func handleGroupStat(groups map[string]*groupStat, key string) *groupStat {
-	stat, exists := groups[key]
-	if !exists {
-		stat = &groupStat{}
-		groups[key] = stat
-	}
-	return stat
-}
-
-// groupKeyOf returns the record's group key as a string. Numbers are
-// formatted so that 200 and "200" land in the same group.
-func groupKeyOf(record map[string]any, field string) (string, error) {
-	raw, ok := record[field]
-	if !ok {
-		return "", fmt.Errorf("%w: %q", errNoGroupKey, field)
-	}
-	key, ok := toString(raw)
-	if !ok {
-		return "", fmt.Errorf("%w: %q has type %T", errBadGroupKey, field, raw)
-	}
-	if key == "" {
-		return "", fmt.Errorf("%w: %q is empty", errBadGroupKey, field)
-	}
-	return key, nil
-}
-
-// processLine adds one NDJSON line to groups. It returns an error when the
-// line can't be assigned to a group; a missing or unusable -field value is
-// not an error, it is counted on the group instead.
-func processLine(groups map[string]*groupStat, line string, cfg configFlags) error {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return errBlankLine
-	}
-
-	var record map[string]any
-	if err := json.Unmarshal([]byte(line), &record); err != nil {
-		return fmt.Errorf("%w: %w", errBadJSON, err)
-	}
-
-	key, err := groupKeyOf(record, cfg.groupField)
-	if err != nil {
-		return err
-	}
-
-	stat := handleGroupStat(groups, key)
-	stat.incrementCount()
-
-	// A missing key gives nil, which toFloat64 rejects like any other
-	// unusable value. The record still counts toward its group.
-	value, ok := toFloat64(record[cfg.valueField])
-	if !ok {
-		stat.incrementSkippedCount()
-		return nil
-	}
-	stat.addValue(value)
-	return nil
-}
-
-// aggregate reads NDJSON from r line by line and builds per-group stats.
-// Taking an io.Reader means stdin, a file, or a strings.Reader in a test all
-// go through the same code.
-func aggregate(r io.Reader, cfg configFlags) (map[string]*groupStat, totals, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
-
-	groups := make(map[string]*groupStat)
-	var t totals
-
-	for scanner.Scan() {
-		t.lines++
-		err := processLine(groups, scanner.Text(), cfg)
-		switch {
-		case err == nil, errors.Is(err, errBlankLine):
-			// A good line, or a blank one: nothing to report in either mode.
-		case cfg.strict:
-			// Stop at the first bad line. %w keeps err in the chain, so the
-			// caller can still ask errors.Is(err, errBadJSON).
-			return nil, t, fmt.Errorf("line %d: %w", t.lines, err)
-		default:
-			// Skip the line, keep going, and count it by kind. The summary
-			// is printed once at the end instead of a log line per skip.
-			t.recordSkip(t.lines, err)
+		// Every failed input is reported, in either mode.
+		printError(stderr, err)
+		ok = false
+		// -strict stops at the first failure; otherwise carry on with the
+		// next input, like cat and grep.
+		if cfg.strict {
+			return false
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, t, fmt.Errorf("reading input after line %d: %w", t.lines, err)
-	}
-	return groups, t, nil
+	printFinalStats(stdout, a.groups, cfg.groupField, a.t)
+	printSkipSummary(stderr, a.t)
+	return ok
 }
 
 func main() {
@@ -315,17 +419,10 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		flag.Usage()
-		os.Exit(2)
+		os.Exit(2) // usage error
 	}
-
-	groups, t, err := aggregate(os.Stdin, cfg)
-	if err != nil {
-		if errors.Is(err, bufio.ErrTooLong) {
-			log.Fatalf("%v (lines are limited to %d bytes)", err, maxLineSize)
-		}
-		log.Fatal(err)
+	// flag.Args() is whatever is left after the flags: the file names.
+	if !run(flag.Args(), cfg, os.Stdin, os.Stdout, os.Stderr) {
+		os.Exit(1) // an input failed, or -strict stopped at a bad line
 	}
-
-	printFinalStats(os.Stdout, groups, cfg.groupField, t)
-	printSkipSummary(os.Stderr, t)
 }

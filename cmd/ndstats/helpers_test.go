@@ -125,6 +125,15 @@ func TestGroupKeyOf(t *testing.T) {
 	}
 }
 
+func TestLocation(t *testing.T) {
+	if got := location("", 9); got != "line 9" {
+		t.Errorf(`location("", 9) = %q; want "line 9"`, got)
+	}
+	if got := location("a.ndjson", 9); got != "a.ndjson:9" {
+		t.Errorf(`location("a.ndjson", 9) = %q; want "a.ndjson:9"`, got)
+	}
+}
+
 func TestKindOf(t *testing.T) {
 	tests := []struct {
 		name string
@@ -148,16 +157,16 @@ func TestKindOf(t *testing.T) {
 
 func TestRecordSkip(t *testing.T) {
 	var tot totals // zero value: reasons map is nil until the first skip
-	tot.recordSkip(2, fmt.Errorf("%w: first", errBadJSON))
-	tot.recordSkip(5, fmt.Errorf("%w: second", errBadJSON))
-	tot.recordSkip(7, fmt.Errorf("%w: %q", errNoGroupKey, "region"))
+	tot.recordSkip("a.ndjson", 2, fmt.Errorf("%w: first", errBadJSON))
+	tot.recordSkip("b.ndjson", 5, fmt.Errorf("%w: second", errBadJSON))
+	tot.recordSkip("", 7, fmt.Errorf("%w: %q", errNoGroupKey, "region"))
 
 	if tot.skipped != 3 {
 		t.Errorf("skipped = %d; want 3", tot.skipped)
 	}
 	bad := tot.reasons[errBadJSON]
-	if bad == nil || bad.count != 2 || bad.firstLine != 2 {
-		t.Fatalf("reasons[errBadJSON] = %+v; want count 2, firstLine 2", bad)
+	if bad == nil || bad.count != 2 || bad.firstFile != "a.ndjson" || bad.firstLine != 2 {
+		t.Fatalf("reasons[errBadJSON] = %+v; want count 2, first at a.ndjson:2", bad)
 	}
 	// Only the first error of each kind is kept.
 	if !strings.Contains(bad.firstErr.Error(), "first") {

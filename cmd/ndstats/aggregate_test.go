@@ -6,22 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"strings"
 	"testing"
 )
 
 var testCfg = configFlags{groupField: "region", valueField: "latency_ms"}
-
-// silenceLog discards the per-line log output from aggregate for the rest of
-// the test, so `go test -v` output stays readable.
-func silenceLog(t *testing.T) {
-	t.Helper()
-	log.SetOutput(io.Discard)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-}
 
 func TestProcessLine(t *testing.T) {
 	tests := []struct {
@@ -190,8 +180,6 @@ func TestAggregate(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			silenceLog(t)
-
 			groups, tot, err := aggregate(strings.NewReader(tc.input), testCfg)
 			if err != nil {
 				t.Fatalf("aggregate() unexpected error: %v", err)
@@ -230,8 +218,6 @@ func TestAggregate(t *testing.T) {
 // TestAggregateSmallFile is the end-to-end check against the hand-worked
 // expected table for testdata/small.ndjson.
 func TestAggregateSmallFile(t *testing.T) {
-	silenceLog(t)
-
 	// Tests run with the package directory as the working directory.
 	f, err := os.Open("../../testdata/small.ndjson")
 	if err != nil {
@@ -308,8 +294,6 @@ func TestAggregateStrict(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			silenceLog(t)
-
 			_, tot, err := aggregate(strings.NewReader(tc.input), strictCfg)
 			if err == nil {
 				t.Fatal("aggregate() in strict mode returned no error for a bad line")
@@ -413,6 +397,14 @@ func TestPrintSkipSummary(t *testing.T) {
 			}},
 			want: "skipped 1 of 19 lines:\n" +
 				"  invalid JSON: 1 (first at line 9: unexpected end of JSON input)\n",
+		},
+		{
+			name: "file name in location",
+			tot: totals{lines: 4, skipped: 1, reasons: map[error]*skipReason{
+				errNoGroupKey: {count: 1, firstFile: "b.ndjson", firstLine: 2, firstErr: fmt.Errorf("%w: %q", errNoGroupKey, "region")},
+			}},
+			want: "skipped 1 of 4 lines:\n" +
+				"  group key not found: 1 (first at b.ndjson:2: \"region\")\n",
 		},
 		{
 			// Printed in skipKinds order, not map order, so output is stable.
