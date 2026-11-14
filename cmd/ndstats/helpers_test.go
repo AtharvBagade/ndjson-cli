@@ -311,6 +311,9 @@ func TestParseConfig(t *testing.T) {
 		{name: "equals syntax", args: []string{"-group=status", "-field=bytes"}, want: configFlags{groupField: "status", valueField: "bytes"}},
 		{name: "strict off by default", args: []string{"-group", "a", "-field", "b"}, want: configFlags{groupField: "a", valueField: "b", strict: false}},
 		{name: "strict flag", args: []string{"-group", "a", "-field", "b", "-strict"}, want: configFlags{groupField: "a", valueField: "b", strict: true}},
+		{name: "no -p means no percentiles", args: []string{"-group", "a", "-field", "b"}, want: configFlags{groupField: "a", valueField: "b", percentiles: nil}},
+		{name: "percentiles", args: []string{"-group", "a", "-field", "b", "-p", "50,95,99"}, want: configFlags{groupField: "a", valueField: "b", percentiles: []float64{50, 95, 99}}},
+		{name: "invalid percentile", args: []string{"-group", "a", "-field", "b", "-p", "status"}, wantErr: "invalid -p value \"status\""},
 		{name: "missing group", args: []string{"-field", "bytes"}, wantErr: "-group"},
 		{name: "missing field", args: []string{"-group", "status"}, wantErr: "-field"},
 		{name: "missing both", args: nil, wantErr: "-group, -field"},
@@ -336,10 +339,100 @@ func TestParseConfig(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseConfig() unexpected error: %v", err)
 			}
-			if got != tc.want {
+			// configFlags holds a slice, and a struct with a slice field
+			// can't be compared with ==, so compare the fields one by one.
+			if got.groupField != tc.want.groupField || got.valueField != tc.want.valueField ||
+				got.strict != tc.want.strict || !slices.Equal(got.percentiles, tc.want.percentiles) {
 				t.Errorf("parseConfig() = %+v; want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestParsePercentiles(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    []float64
+		wantErr bool
+	}{
+		{input: "", want: nil},
+		{input: "  ", want: nil},
+		{input: "50,95,99", want: []float64{50, 95, 99}},
+		{input: "99, 50 ,95", want: []float64{50, 95, 99}}, // sorted, spaces trimmed
+		{input: "50,50,99,50", want: []float64{50, 99}},    // duplicates removed
+		{input: "99.9", want: []float64{99.9}},
+		{input: "0,100", want: []float64{0, 100}},
+		{input: "status", wantErr: true},
+		{input: "101", wantErr: true},
+		{input: "-1", wantErr: true},
+		{input: "NaN", wantErr: true}, // ParseFloat accepts it; the range check must not
+		{input: "Inf", wantErr: true},
+		{input: "50,,99", wantErr: true},
+		{input: "50,", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got, err := parsePercentiles(tc.input)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("parsePercentiles(%q) error = %v; wantErr %v", tc.input, err, tc.wantErr)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("parsePercentiles(%q) = %v; want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPercentileLabel(t *testing.T) {
+	for p, want := range map[float64]string{50: "p50", 99.9: "p99.9", 0: "p0", 100: "p100", 99.99: "p99.99"} {
+		if got := percentileLabel(p); got != want {
+			t.Errorf("percentileLabel(%v) = %q; want %q", p, got, want)
+		}
+	}
+}
+
+func TestGroupStatPercentile(t *testing.T) {
+	g := groupStat{values: &sketch{}}
+	for _, v := range []float64{3.2, 9.7, 12.4, 250, 980} {
+		g.addValue(v)
+	}
+	tests := []struct {
+		p    float64
+		want float64
+	}{
+		{p: 0, want: 3.2},   // exact min, not a bucket estimate
+		{p: 100, want: 980}, // exact max
+		{p: 50, want: 12.4},
+		{p: 99, want: 980}, // nearest rank: the tail isn't understated
+	}
+	for _, tc := range tests {
+		got := g.percentile(tc.p)
+		if tc.p == 0 || tc.p == 100 {
+			if got != tc.want {
+				t.Errorf("percentile(%v) = %v; want exactly %v", tc.p, got, tc.want)
+			}
+			continue
+		}
+		if !withinRelative(got, tc.want, relativeAccuracy) {
+			t.Errorf("percentile(%v) = %v; want within 1%% of %v", tc.p, got, tc.want)
+		}
+		if got < g.min || got > g.max {
+			t.Errorf("percentile(%v) = %v; outside [%v, %v]", tc.p, got, g.min, g.max)
+		}
+	}
+}
+
+func TestGroupStatWithoutSketch(t *testing.T) {
+	// Without -p no sketch is created: values still update min/max/mean,
+	// and percentile reports NaN rather than a made-up number.
+	var g groupStat
+	g.addValue(5)
+	if g.values != nil {
+		t.Fatal("sketch created without -p")
+	}
+	if got := g.percentile(50); !math.IsNaN(got) {
+		t.Errorf("percentile without a sketch = %v; want NaN", got)
 	}
 }
 

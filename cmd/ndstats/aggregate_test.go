@@ -225,7 +225,9 @@ func TestAggregateSmallFile(t *testing.T) {
 	}
 	defer f.Close()
 
-	groups, tot, err := aggregate(f, testCfg)
+	cfg := testCfg
+	cfg.percentiles = []float64{50, 95}
+	groups, tot, err := aggregate(f, cfg)
 	if err != nil {
 		t.Fatalf("aggregate() unexpected error: %v", err)
 	}
@@ -255,6 +257,21 @@ func TestAggregateSmallFile(t *testing.T) {
 			g.min != w.min || g.max != w.max || !almostEqual(g.mean(), w.mean) {
 			t.Errorf("group %q = {count %d, values %d, skipped %d, min %v, max %v, mean %v}; want %+v",
 				key, g.count, g.valueCount, g.skippedCount, g.min, g.max, g.mean(), w)
+		}
+	}
+
+	// Percentiles, against the exact nearest-rank values worked out by
+	// hand from the file (us-east: 3.2, 9.7, 12.4, 250, 980).
+	pcts := map[string]map[float64]float64{
+		"us-east":  {50: 12.4, 95: 980},
+		"eu-west":  {50: 22.0, 95: 45},    // 18.9, 22.0, 30.1, 45
+		"ap-south": {50: 7.5, 95: 1200.5}, // 7.5, 1200.5
+	}
+	for key, ps := range pcts {
+		for p, exact := range ps {
+			if got := groups[key].percentile(p); !withinRelative(got, exact, relativeAccuracy) {
+				t.Errorf("group %q p%v = %v; want within 1%% of %v", key, p, got, exact)
+			}
 		}
 	}
 }
@@ -330,6 +347,22 @@ func TestAggregateStrictAcceptsGoodInput(t *testing.T) {
 	}
 }
 
+func TestSketchOnlyWithPercentiles(t *testing.T) {
+	input := `{"region":"a","latency_ms":1}` + "\n"
+
+	groups, _, _ := aggregate(strings.NewReader(input), testCfg)
+	if groups["a"].values != nil {
+		t.Error("sketch created although no -p was given")
+	}
+
+	cfg := testCfg
+	cfg.percentiles = []float64{50}
+	groups, _, _ = aggregate(strings.NewReader(input), cfg)
+	if groups["a"].values == nil || groups["a"].values.count != 1 {
+		t.Errorf("sketch = %+v; want one with 1 value when -p is given", groups["a"].values)
+	}
+}
+
 func TestAggregateLongLine(t *testing.T) {
 	f, err := os.Open("../../testdata/longline.ndjson")
 	if err != nil {
@@ -365,7 +398,7 @@ func TestPrintFinalStats(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	printFinalStats(&buf, groups, "region", totals{lines: 4, skipped: 1})
+	printFinalStats(&buf, groups, "region", nil, totals{lines: 4, skipped: 1})
 
 	want := "" +
 		"region         count  values  skipped        min        max       mean\n" +
@@ -374,6 +407,32 @@ func TestPrintFinalStats(t *testing.T) {
 		"Total lines processed: 4\n" +
 		"Lines skipped: 1\n"
 
+	if got := buf.String(); got != want {
+		t.Errorf("printFinalStats output mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestPrintFinalStatsPercentiles(t *testing.T) {
+	g := &groupStat{values: &sketch{}}
+	for _, v := range []float64{10, 20, 30, 40} {
+		g.addValue(v)
+		g.incrementCount()
+	}
+	groups := map[string]*groupStat{
+		"a": g,
+		"b": {count: 1, skippedCount: 1}, // no usable values: every stat column is "-"
+	}
+
+	var buf bytes.Buffer
+	printFinalStats(&buf, groups, "region", []float64{0, 50, 99.9}, totals{lines: 5})
+
+	// p50 of 10, 20, 30, 40 is exactly 20; the sketch reports 19.89, within 1%.
+	want := "" +
+		"region         count  values  skipped        min        max       mean         p0        p50      p99.9\n" +
+		"a                  4       4        0      10.00      40.00      25.00      10.00      19.89      40.00\n" +
+		"b                  1       0        1          -          -          -          -          -          -\n" +
+		"Total lines processed: 5\n" +
+		"Lines skipped: 0\n"
 	if got := buf.String(); got != want {
 		t.Errorf("printFinalStats output mismatch\ngot:\n%s\nwant:\n%s", got, want)
 	}

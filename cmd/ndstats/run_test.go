@@ -118,6 +118,12 @@ func TestRun(t *testing.T) {
 			wantStderr: []string{"first at <stdin>:2:"},
 		},
 		{
+			name:       "-p adds percentile columns",
+			paths:      []string{a, b},
+			cfg:        configFlags{groupField: "region", valueField: "latency_ms", percentiles: []float64{50, 99}},
+			wantStdout: []string{"mean        p50        p99"},
+		},
+		{
 			name:       "directory is reported like any unreadable file",
 			paths:      []string{dir, a},
 			cfg:        runCfg,

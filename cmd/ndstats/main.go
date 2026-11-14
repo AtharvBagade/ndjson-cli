@@ -36,9 +36,10 @@ var (
 var skipKinds = []error{errBadJSON, errNoGroupKey, errBadGroupKey, errOtherSkip}
 
 type configFlags struct {
-	groupField string
-	valueField string
-	strict     bool
+	groupField  string
+	valueField  string
+	strict      bool
+	percentiles []float64 // from -p, sorted and without duplicates; nil if not given
 }
 
 // skipReason summarises every skipped line of one kind in constant memory:
@@ -80,6 +81,7 @@ type groupStat struct {
 	sum          float64 // running total of values, for the mean
 	min          float64 // only valid when valueCount > 0
 	max          float64 // only valid when valueCount > 0
+	values       *sketch // for percentiles; nil unless -p was given, so groups cost nothing extra without it
 }
 
 func (g *groupStat) getGroupStats() int {
@@ -103,10 +105,29 @@ func (g *groupStat) addValue(v float64) {
 	}
 	g.sum += v
 	g.valueCount++
+	if g.values != nil {
+		g.values.add(v)
+	}
 }
 
 func (g *groupStat) mean() float64 {
 	return g.sum / float64(g.valueCount)
+}
+
+// percentile estimates the p-th percentile (0..100) of the group's values.
+// p0 and p100 are the exact min and max, and other estimates are kept
+// within that range, so nothing outside the observed values is reported.
+func (g *groupStat) percentile(p float64) float64 {
+	if g.values == nil {
+		return math.NaN() // percentiles weren't requested for this run
+	}
+	switch p {
+	case 0:
+		return g.min
+	case 100:
+		return g.max
+	}
+	return min(max(g.values.quantile(p/100), g.min), g.max)
 }
 
 // aggregator accumulates stats across any number of inputs, so several files
@@ -186,9 +207,10 @@ func parseConfig() (configFlags, error) {
 	group := flag.String("group", "", "field to group records by")
 	field := flag.String("field", "", "field to calculate statistics for")
 	strict := flag.Bool("strict", false, "stop at the first line that can't be assigned to a group, or the first file that can't be read")
+	pList := flag.String("p", "", "comma-separated percentiles to report, e.g. 50,95,99 or 99.9 (estimated within 1%)")
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		fmt.Fprintln(out, "usage: ndstats -group <field> -field <field> [-strict] [file ...]")
+		fmt.Fprintln(out, "usage: ndstats -group <field> -field <field> [-p 50,95,99] [-strict] [file ...]")
 		fmt.Fprintln(out, "Reads NDJSON from the files, or from stdin if none are given (\"-\" also means stdin).")
 		flag.PrintDefaults()
 	}
@@ -205,7 +227,41 @@ func parseConfig() (configFlags, error) {
 		return configFlags{}, fmt.Errorf("missing required flag(s): %s", strings.Join(missing, ", "))
 	}
 
-	return configFlags{groupField: *group, valueField: *field, strict: *strict}, nil
+	percentiles, err := parsePercentiles(*pList)
+	if err != nil {
+		return configFlags{}, err
+	}
+
+	return configFlags{groupField: *group, valueField: *field, strict: *strict, percentiles: percentiles}, nil
+}
+
+// parsePercentiles turns "95, 50,99.9" into [50 95 99.9]: each value must be
+// a number from 0 to 100. The result is sorted and has no duplicates, so
+// the columns come out in order. "" gives nil (no percentile columns).
+func parsePercentiles(s string) ([]float64, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	var ps []float64
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		p, err := strconv.ParseFloat(part, 64)
+		// !(p >= 0 && p <= 100) also rejects NaN, which fails every comparison.
+		if err != nil || !(p >= 0 && p <= 100) {
+			return nil, fmt.Errorf("invalid -p value %q: want numbers from 0 to 100, e.g. -p 50,95,99", part)
+		}
+		ps = append(ps, p)
+	}
+	slices.Sort(ps)
+	// Compact removes adjacent duplicates in place and returns the shorter
+	// slice; the result must be used, as with append.
+	return slices.Compact(ps), nil
+}
+
+// percentileLabel formats a percentile as a column heading: 50 -> "p50",
+// 99.9 -> "p99.9".
+func percentileLabel(p float64) string {
+	return "p" + strconv.FormatFloat(p, 'f', -1, 64)
 }
 
 func toFloat64(value any) (float64, bool) {
@@ -283,6 +339,10 @@ func processLine(groups map[string]*groupStat, line string, cfg configFlags) err
 	}
 
 	stat := handleGroupStat(groups, key)
+	if stat.values == nil && len(cfg.percentiles) > 0 {
+		// About 5 KB per group, so only pay for it when -p asks for it.
+		stat.values = &sketch{}
+	}
 	stat.incrementCount()
 
 	// A missing key gives nil, which toFloat64 rejects like any other
@@ -338,16 +398,30 @@ func normaliseGroupKeys(groups map[string]*groupStat) []string {
 
 // printFinalStats writes to w rather than stdout so tests can capture the
 // output in a bytes.Buffer.
-func printFinalStats(w io.Writer, groups map[string]*groupStat, groupField string, t totals) {
-	fmt.Fprintf(w, "%-12s %7s %7s %8s %10s %10s %10s\n", groupField, "count", "values", "skipped", "min", "max", "mean")
+func printFinalStats(w io.Writer, groups map[string]*groupStat, groupField string, percentiles []float64, t totals) {
+	fmt.Fprintf(w, "%-12s %7s %7s %8s %10s %10s %10s", groupField, "count", "values", "skipped", "min", "max", "mean")
+	for _, p := range percentiles {
+		fmt.Fprintf(w, " %10s", percentileLabel(p))
+	}
+	fmt.Fprintln(w)
+
 	for _, key := range normaliseGroupKeys(groups) {
 		stat := groups[key]
+		fmt.Fprintf(w, "%-12s %7d %7d %8d", key, stat.count, stat.valueCount, stat.skippedCount)
 		if stat.valueCount == 0 {
-			// No usable values: min, max and mean are undefined, not 0.
-			fmt.Fprintf(w, "%-12s %7d %7d %8d %10s %10s %10s\n", key, stat.count, stat.valueCount, stat.skippedCount, "-", "-", "-")
+			// No usable values: min, max, mean and percentiles are
+			// undefined, not 0.
+			for range 3 + len(percentiles) {
+				fmt.Fprintf(w, " %10s", "-")
+			}
+			fmt.Fprintln(w)
 			continue
 		}
-		fmt.Fprintf(w, "%-12s %7d %7d %8d %10.2f %10.2f %10.2f\n", key, stat.count, stat.valueCount, stat.skippedCount, stat.min, stat.max, stat.mean())
+		fmt.Fprintf(w, " %10.2f %10.2f %10.2f", stat.min, stat.max, stat.mean())
+		for _, p := range percentiles {
+			fmt.Fprintf(w, " %10.2f", stat.percentile(p))
+		}
+		fmt.Fprintln(w)
 	}
 	fmt.Fprintf(w, "Total lines processed: %d\n", t.lines)
 	fmt.Fprintf(w, "Lines skipped: %d\n", t.skipped)
@@ -409,7 +483,7 @@ func run(paths []string, cfg configFlags, stdin io.Reader, stdout, stderr io.Wri
 		}
 	}
 
-	printFinalStats(stdout, a.groups, cfg.groupField, a.t)
+	printFinalStats(stdout, a.groups, cfg.groupField, cfg.percentiles, a.t)
 	printSkipSummary(stderr, a.t)
 	return ok
 }
