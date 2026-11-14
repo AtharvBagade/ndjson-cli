@@ -21,8 +21,20 @@ import (
 // never grows past this, which keeps memory bounded on any input.
 const maxLineSize = 1 << 20 // 1 MB
 
-var errBlankLine = errors.New("blank line")
-var errBadJSON = errors.New("invalid JSON")
+// Sentinel errors: one value per kind of problem. processLine returns them
+// (wrapped with details), and callers recognise the kind with errors.Is.
+// Their text doubles as the label in the skip summary.
+var (
+	errBlankLine   = errors.New("blank line")
+	errBadJSON     = errors.New("invalid JSON")
+	errNoGroupKey  = errors.New("group key not found")
+	errBadGroupKey = errors.New("unusable group key")
+	errOtherSkip   = errors.New("other error")
+)
+
+// skipKinds lists the reasons a line can be skipped, in the order the
+// summary prints them. errOtherSkip catches any kind not listed here.
+var skipKinds = []error{errBadJSON, errNoGroupKey, errBadGroupKey, errOtherSkip}
 
 type configFlags struct {
 	groupField string
@@ -30,10 +42,45 @@ type configFlags struct {
 	strict     bool
 }
 
+// skipReason summarises every skipped line of one kind in constant memory:
+// a count, plus the line number and error of the first occurrence.
+type skipReason struct {
+	count     int
+	firstLine int
+	firstErr  error
+}
+
 // totals counts input lines across all groups.
 type totals struct {
-	lines   int // every line read, including blank and malformed ones
-	skipped int // lines that never reached a group
+	lines   int                   // every line read, including blank and malformed ones
+	skipped int                   // lines that never reached a group
+	reasons map[error]*skipReason // keyed by sentinel (one of skipKinds)
+}
+
+// kindOf returns which sentinel in skipKinds err wraps, or errOtherSkip.
+func kindOf(err error) error {
+	for _, kind := range skipKinds {
+		if errors.Is(err, kind) {
+			return kind
+		}
+	}
+	return errOtherSkip
+}
+
+// recordSkip counts a skipped line under its kind. Only the first line and
+// error of each kind are kept, so memory doesn't grow with bad lines.
+func (t *totals) recordSkip(line int, err error) {
+	if t.reasons == nil {
+		t.reasons = make(map[error]*skipReason)
+	}
+	kind := kindOf(err)
+	r, ok := t.reasons[kind]
+	if !ok {
+		r = &skipReason{firstLine: line, firstErr: err}
+		t.reasons[kind] = r
+	}
+	r.count++
+	t.skipped++
 }
 
 type groupStat struct {
@@ -98,6 +145,26 @@ func printFinalStats(w io.Writer, groups map[string]*groupStat, groupField strin
 	}
 	fmt.Fprintf(w, "Total lines processed: %d\n", t.lines)
 	fmt.Fprintf(w, "Lines skipped: %d\n", t.skipped)
+}
+
+// printSkipSummary writes one line per kind of skipped line, in skipKinds
+// order, and nothing at all if no line was skipped.
+func printSkipSummary(w io.Writer, t totals) {
+	if t.skipped == 0 {
+		return
+	}
+	fmt.Fprintf(w, "skipped %d of %d lines:\n", t.skipped, t.lines)
+	for _, kind := range skipKinds {
+		r, ok := t.reasons[kind]
+		if !ok {
+			continue
+		}
+		// kind.Error() is the sentinel's own text, e.g. "invalid JSON".
+		// firstErr starts with that same text (it was wrapped as
+		// "%w: details"), so trim it to avoid printing the label twice.
+		detail := strings.TrimPrefix(r.firstErr.Error(), kind.Error()+": ")
+		fmt.Fprintf(w, "  %s: %d (first at line %d: %s)\n", kind.Error(), r.count, r.firstLine, detail)
+	}
 }
 
 func toFloat64(value any) (float64, bool) {
@@ -165,14 +232,14 @@ func handleGroupStat(groups map[string]*groupStat, key string) *groupStat {
 func groupKeyOf(record map[string]any, field string) (string, error) {
 	raw, ok := record[field]
 	if !ok {
-		return "", fmt.Errorf("group key %q not found", field)
+		return "", fmt.Errorf("%w: %q", errNoGroupKey, field)
 	}
 	key, ok := toString(raw)
 	if !ok {
-		return "", fmt.Errorf("group key %q has unsupported type %T", field, raw)
+		return "", fmt.Errorf("%w: %q has type %T", errBadGroupKey, field, raw)
 	}
 	if key == "" {
-		return "", fmt.Errorf("group key %q is empty", field)
+		return "", fmt.Errorf("%w: %q is empty", errBadGroupKey, field)
 	}
 	return key, nil
 }
@@ -231,9 +298,9 @@ func aggregate(r io.Reader, cfg configFlags) (map[string]*groupStat, totals, err
 			// caller can still ask errors.Is(err, errBadJSON).
 			return nil, t, fmt.Errorf("line %d: %w", t.lines, err)
 		default:
-			// Skip the line, keep going, and count it.
-			log.Printf("line %d: %v", t.lines, err)
-			t.skipped++
+			// Skip the line, keep going, and count it by kind. The summary
+			// is printed once at the end instead of a log line per skip.
+			t.recordSkip(t.lines, err)
 		}
 	}
 
@@ -260,4 +327,5 @@ func main() {
 	}
 
 	printFinalStats(os.Stdout, groups, cfg.groupField, t)
+	printSkipSummary(os.Stderr, t)
 }

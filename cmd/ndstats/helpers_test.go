@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"math"
 	"os"
 	"slices"
@@ -87,35 +89,85 @@ func TestToString(t *testing.T) {
 
 func TestGroupKeyOf(t *testing.T) {
 	tests := []struct {
-		name    string
-		record  map[string]any
-		want    string
-		wantErr bool
+		name   string
+		record map[string]any
+		want   string
+		wantIs error // sentinel the error must wrap; nil means no error
 	}{
 		{name: "string key", record: map[string]any{"region": "us-east"}, want: "us-east"},
 		{name: "numeric key", record: map[string]any{"region": 200.0}, want: "200"},
 		{name: "padded key is trimmed", record: map[string]any{"region": " us-east "}, want: "us-east"},
-		{name: "empty key", record: map[string]any{"region": ""}, wantErr: true},
-		{name: "whitespace-only key", record: map[string]any{"region": "   "}, wantErr: true},
-		{name: "missing key", record: map[string]any{"other": "x"}, wantErr: true},
-		{name: "null key", record: map[string]any{"region": nil}, wantErr: true},
-		{name: "bool key", record: map[string]any{"region": true}, wantErr: true},
-		{name: "object key", record: map[string]any{"region": map[string]any{}}, wantErr: true},
+		{name: "empty key", record: map[string]any{"region": ""}, wantIs: errBadGroupKey},
+		{name: "whitespace-only key", record: map[string]any{"region": "   "}, wantIs: errBadGroupKey},
+		{name: "missing key", record: map[string]any{"other": "x"}, wantIs: errNoGroupKey},
+		{name: "null key", record: map[string]any{"region": nil}, wantIs: errBadGroupKey},
+		{name: "bool key", record: map[string]any{"region": true}, wantIs: errBadGroupKey},
+		{name: "object key", record: map[string]any{"region": map[string]any{}}, wantIs: errBadGroupKey},
 		// json.Unmarshal of the line `null` gives a nil map; reading from a
 		// nil map is allowed and behaves like a missing key.
-		{name: "nil record", record: nil, wantErr: true},
+		{name: "nil record", record: nil, wantIs: errNoGroupKey},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := groupKeyOf(tc.record, "region")
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("groupKeyOf(%v) error = %v; wantErr %v", tc.record, err, tc.wantErr)
+			if tc.wantIs == nil {
+				if err != nil {
+					t.Fatalf("groupKeyOf(%v) unexpected error: %v", tc.record, err)
+				}
+			} else if !errors.Is(err, tc.wantIs) {
+				t.Fatalf("groupKeyOf(%v) error = %v; want errors.Is(err, %v)", tc.record, err, tc.wantIs)
 			}
 			if got != tc.want {
 				t.Errorf("groupKeyOf(%v) = %q; want %q", tc.record, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestKindOf(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{name: "sentinel itself", err: errBadJSON, want: errBadJSON},
+		{name: "wrapped once", err: fmt.Errorf("%w: %q", errNoGroupKey, "region"), want: errNoGroupKey},
+		{name: "wrapped twice", err: fmt.Errorf("line 3: %w", fmt.Errorf("%w: x", errBadGroupKey)), want: errBadGroupKey},
+		{name: "unknown error", err: errors.New("disk on fire"), want: errOtherSkip},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := kindOf(tc.err); got != tc.want {
+				t.Errorf("kindOf(%v) = %v; want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecordSkip(t *testing.T) {
+	var tot totals // zero value: reasons map is nil until the first skip
+	tot.recordSkip(2, fmt.Errorf("%w: first", errBadJSON))
+	tot.recordSkip(5, fmt.Errorf("%w: second", errBadJSON))
+	tot.recordSkip(7, fmt.Errorf("%w: %q", errNoGroupKey, "region"))
+
+	if tot.skipped != 3 {
+		t.Errorf("skipped = %d; want 3", tot.skipped)
+	}
+	bad := tot.reasons[errBadJSON]
+	if bad == nil || bad.count != 2 || bad.firstLine != 2 {
+		t.Fatalf("reasons[errBadJSON] = %+v; want count 2, firstLine 2", bad)
+	}
+	// Only the first error of each kind is kept.
+	if !strings.Contains(bad.firstErr.Error(), "first") {
+		t.Errorf("firstErr = %v; want the first error, not a later one", bad.firstErr)
+	}
+	if r := tot.reasons[errNoGroupKey]; r == nil || r.count != 1 || r.firstLine != 7 {
+		t.Errorf("reasons[errNoGroupKey] = %+v; want count 1, firstLine 7", r)
+	}
+	if _, ok := tot.reasons[errBadGroupKey]; ok {
+		t.Error("a kind that never happened has an entry")
 	}
 }
 

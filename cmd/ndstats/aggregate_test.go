@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -49,10 +50,10 @@ func TestProcessLine(t *testing.T) {
 		{name: "array instead of object", line: `[1,2,3]`, wantErr: true, wantIs: errBadJSON},
 		{name: "blank line", line: ``, wantErr: true, wantIs: errBlankLine},
 		{name: "whitespace-only line", line: " \t ", wantErr: true, wantIs: errBlankLine},
-		{name: "JSON null line", line: `null`, wantErr: true},
-		{name: "missing group key", line: `{"latency_ms":5}`, wantErr: true},
-		{name: "unsupported group key type", line: `{"region":true,"latency_ms":5}`, wantErr: true},
-		{name: "whitespace-only group key", line: `{"region":"   ","latency_ms":5}`, wantErr: true},
+		{name: "JSON null line", line: `null`, wantErr: true, wantIs: errNoGroupKey},
+		{name: "missing group key", line: `{"latency_ms":5}`, wantErr: true, wantIs: errNoGroupKey},
+		{name: "unsupported group key type", line: `{"region":true,"latency_ms":5}`, wantErr: true, wantIs: errBadGroupKey},
+		{name: "whitespace-only group key", line: `{"region":"   ","latency_ms":5}`, wantErr: true, wantIs: errBadGroupKey},
 	}
 
 	for _, tc := range tests {
@@ -116,6 +117,7 @@ func TestAggregate(t *testing.T) {
 		input       string
 		wantLines   int
 		wantSkipped int
+		wantReasons map[error]skipReason // count and firstLine per kind; firstErr not compared
 		wantGroups  map[string]want
 	}{
 		{
@@ -163,7 +165,12 @@ func TestAggregate(t *testing.T) {
 			}, "\n"),
 			wantLines:   5,
 			wantSkipped: 5,
-			wantGroups:  map[string]want{},
+			wantReasons: map[error]skipReason{
+				errBadJSON:     {count: 2, firstLine: 1},
+				errNoGroupKey:  {count: 1, firstLine: 3},
+				errBadGroupKey: {count: 2, firstLine: 4},
+			},
+			wantGroups: map[string]want{},
 		},
 		{
 			name: "padded keys merge",
@@ -190,7 +197,13 @@ func TestAggregate(t *testing.T) {
 				t.Fatalf("aggregate() unexpected error: %v", err)
 			}
 			if tot.lines != tc.wantLines || tot.skipped != tc.wantSkipped {
-				t.Errorf("totals = %+v; want lines %d, skipped %d", tot, tc.wantLines, tc.wantSkipped)
+				t.Errorf("totals = lines %d, skipped %d; want lines %d, skipped %d", tot.lines, tot.skipped, tc.wantLines, tc.wantSkipped)
+			}
+			for kind, w := range tc.wantReasons {
+				r := tot.reasons[kind]
+				if r == nil || r.count != w.count || r.firstLine != w.firstLine {
+					t.Errorf("reasons[%v] = %+v; want count %d, firstLine %d", kind, r, w.count, w.firstLine)
+				}
 			}
 			if len(groups) != len(tc.wantGroups) {
 				t.Fatalf("got %d groups %v; want %d", len(groups), groups, len(tc.wantGroups))
@@ -232,7 +245,10 @@ func TestAggregateSmallFile(t *testing.T) {
 	}
 	// Line 9 is truncated JSON; line 11 is blank and not counted.
 	if tot.lines != 19 || tot.skipped != 1 {
-		t.Errorf("totals = %+v; want lines 19, skipped 1", tot)
+		t.Errorf("totals = lines %d, skipped %d; want lines 19, skipped 1", tot.lines, tot.skipped)
+	}
+	if r := tot.reasons[errBadJSON]; r == nil || r.count != 1 || r.firstLine != 9 {
+		t.Errorf("reasons[errBadJSON] = %+v; want count 1, firstLine 9", r)
 	}
 
 	want := map[string]struct {
@@ -376,5 +392,50 @@ func TestPrintFinalStats(t *testing.T) {
 
 	if got := buf.String(); got != want {
 		t.Errorf("printFinalStats output mismatch\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestPrintSkipSummary(t *testing.T) {
+	tests := []struct {
+		name string
+		tot  totals
+		want string
+	}{
+		{
+			name: "nothing skipped prints nothing",
+			tot:  totals{lines: 10},
+			want: "",
+		},
+		{
+			name: "one kind",
+			tot: totals{lines: 19, skipped: 1, reasons: map[error]*skipReason{
+				errBadJSON: {count: 1, firstLine: 9, firstErr: fmt.Errorf("%w: %w", errBadJSON, errors.New("unexpected end of JSON input"))},
+			}},
+			want: "skipped 1 of 19 lines:\n" +
+				"  invalid JSON: 1 (first at line 9: unexpected end of JSON input)\n",
+		},
+		{
+			// Printed in skipKinds order, not map order, so output is stable.
+			name: "several kinds in fixed order",
+			tot: totals{lines: 7, skipped: 6, reasons: map[error]*skipReason{
+				errBadGroupKey: {count: 2, firstLine: 5, firstErr: fmt.Errorf("%w: %q has type bool", errBadGroupKey, "region")},
+				errNoGroupKey:  {count: 2, firstLine: 3, firstErr: fmt.Errorf("%w: %q", errNoGroupKey, "region")},
+				errBadJSON:     {count: 2, firstLine: 2, firstErr: fmt.Errorf("%w: %w", errBadJSON, errors.New("bad"))},
+			}},
+			want: "skipped 6 of 7 lines:\n" +
+				"  invalid JSON: 2 (first at line 2: bad)\n" +
+				"  group key not found: 2 (first at line 3: \"region\")\n" +
+				"  unusable group key: 2 (first at line 5: \"region\" has type bool)\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			printSkipSummary(&buf, tc.tot)
+			if got := buf.String(); got != tc.want {
+				t.Errorf("printSkipSummary output mismatch\ngot:\n%s\nwant:\n%s", got, tc.want)
+			}
+		})
 	}
 }
