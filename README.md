@@ -228,3 +228,7 @@ The tests are table-driven and split by topic:
 - **Integer fields:** percentiles are estimates, so p50 of whole numbers can print as e.g. `2.98`. Rounding when every value in a group is a whole number would fix this.
 - **`-v` (verbose):** an idea not built: optionally log every skipped line as well as the summary, e.g. to `grep` through them.
 - **Nested field paths** (`meta.host`) aren't supported.
+
+## License
+
+[MIT](LICENSE)
